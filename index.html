@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Demo nhận dạng giọng nói tiếng Việt</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 640px;
+      margin: 40px auto;
+      padding: 0 16px;
+      background: #111;
+      color: #eee;
+    }
+
+    button {
+      font-size: 18px;
+      padding: 12px 24px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+    }
+
+    #mic {
+      background: #2563eb;
+      color: white;
+    }
+
+    #mic.recording {
+      background: #dc2626;
+    }
+
+    #status {
+      color: #888;
+      margin: 12px 0;
+      min-height: 1.2em;
+    }
+
+    #transcript {
+      line-height: 1.7;
+      white-space: pre-wrap;
+    }
+
+    .partial {
+      color: #888;
+      font-style: italic;
+    }
+
+    a {
+      color: #60a5fa;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Demo nhận dạng giọng nói tiếng Việt (thời gian thực)</h2>
+  <p>
+    Model: <select id="modelSelect">
+      <option value="phowhisper">Đang tải danh sách...</option>
+    </select>
+  </p>
+  <p id="status">Bấm nút rồi cho phép truy cập mic.</p>
+  <button id="mic">🎙️ Bắt đầu nói</button>
+  <p id="transcript"></p>
+  <p style="color:#666; font-size: 13px;">
+    Đây là bản demo thử nghiệm — chạy trên CPU miễn phí nên có thể chậm hơn thực tế production.
+    <span id="lablink"></span>
+  </p>
+
+  <script>
+    const micBtn = document.getElementById("mic");
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const modelSelect = document.getElementById("modelSelect");
+
+    fetch("/models").then(r => r.json()).then(info => {
+      modelSelect.innerHTML = "";
+      for (const m of info.models) {
+        const opt = document.createElement("option");
+        opt.value = m.name;
+        opt.textContent = m.label;
+        if (m.name === info.default) opt.selected = true;
+        modelSelect.appendChild(opt);
+      }
+    }).catch(() => {
+      // /models lỗi thì vẫn để dropdown mặc định phowhisper, không chặn demo
+    });
+
+    const LAB_URL = "{{LAB_URL}}";
+    const LAB_LABEL = "{{LAB_LABEL}}";
+    if (LAB_URL && !LAB_URL.includes("localhost")) {
+      document.getElementById("lablink").innerHTML =
+        ` Xem thêm tại <a href="${LAB_URL}" target="_blank">${LAB_LABEL}</a>.`;
+    }
+
+    let ws = null;
+    let audioCtx = null;
+    let stream = null;
+    let workletNode = null;
+    let recording = false;
+    let partialSpan = null;
+    let currentUtt = 0;
+    let speechActive = false;
+    let transcriptClearTimer = null;
+    const TRANSCRIPT_CLEAR_DELAY_MS = 5000;
+
+    function clearTranscript() {
+      clearTimeout(transcriptClearTimer);
+      transcriptClearTimer = null;
+      transcriptEl.textContent = "";
+      partialSpan = null;
+    }
+
+    function scheduleTranscriptClear() {
+      clearTimeout(transcriptClearTimer);
+      transcriptClearTimer = setTimeout(clearTranscript, TRANSCRIPT_CLEAR_DELAY_MS);
+    }
+
+    function wsUrl() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const model = encodeURIComponent(modelSelect.value || "phowhisper");
+      return `${proto}//${location.host}/ws?model=${model}`;
+    }
+
+    async function start() {
+      statusEl.textContent = "Đang kết nối...";
+      ws = new WebSocket(wsUrl());
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = async () => {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+          audioCtx = new AudioContext({ sampleRate: 48000 }); // trình duyệt tự resample bên trong worklet
+          const src = audioCtx.createMediaStreamSource(stream);
+
+          // Downsample thủ công về 16kHz PCM16LE bằng ScriptProcessor — chọn cách đơn giản
+          // nhất để tương thích mọi trình duyệt, không cần build AudioWorklet riêng.
+          const bufferSize = 4096;
+          const proc = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+          const ratio = audioCtx.sampleRate / 16000;
+
+          proc.onaudioprocess = (e) => {
+            if (!recording || ws.readyState !== WebSocket.OPEN) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const outLen = Math.floor(input.length / ratio);
+            const pcm16 = new Int16Array(outLen);
+            for (let i = 0; i < outLen; i++) {
+              const s = input[Math.floor(i * ratio)];
+              pcm16[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32768)));
+            }
+            ws.send(pcm16.buffer);
+          };
+
+          src.connect(proc);
+          proc.connect(audioCtx.destination); // Safari cần connect tới destination mới chạy callback
+          workletNode = proc;
+          recording = true;
+          statusEl.textContent = "Đang nghe — cứ nói bình thường.";
+          micBtn.textContent = "⏹️ Dừng";
+          micBtn.classList.add("recording");
+          modelSelect.disabled = true; // đổi model giữa chừng không có tác dụng, khoá lại cho rõ
+        } catch (err) {
+          statusEl.textContent = err.name === "NotAllowedError"
+            ? "Trình duyệt chưa cho phép dùng microphone."
+            : `Không thể bắt đầu microphone: ${err.message || err}`;
+          stop(false);
+        }
+      };
+
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === "ready") {
+          if (msg.model !== msg.requested_model) {
+            statusEl.textContent = `Model "${msg.requested_model}" chưa sẵn sàng trên server, đang dùng "${msg.model}" thay thế.`;
+            modelSelect.value = msg.model;
+          }
+        } else if (msg.type === "partial") {
+          if (msg.utt !== currentUtt) return;
+          if (!partialSpan) {
+            partialSpan = document.createElement("span");
+            partialSpan.className = "partial";
+            transcriptEl.appendChild(partialSpan);
+          }
+          partialSpan.textContent = msg.text;
+        } else if (msg.type === "final") {
+          if (msg.utt !== currentUtt) return;
+          if (partialSpan) { partialSpan.remove(); partialSpan = null; }
+          if (msg.text) transcriptEl.append(msg.text + " ");
+          if (!speechActive && msg.text) scheduleTranscriptClear();
+        } else if (msg.type === "dropped") {
+          if (msg.utt === currentUtt && partialSpan) { partialSpan.remove(); partialSpan = null; }
+        } else if (msg.type === "speech") {
+          if (msg.on) {
+            currentUtt = msg.utt;
+            speechActive = true;
+            clearTranscript();
+          } else if (msg.utt === currentUtt) {
+            speechActive = false;
+          }
+          statusEl.textContent = msg.on ? "Đang nghe bạn nói..." : "Đang nghe — cứ nói bình thường.";
+        }
+      };
+
+      ws.onclose = (event) => {
+        if (recording || ws) {
+          stop(false);
+          statusEl.textContent = `Mất kết nối WebSocket (mã ${event.code}) — bấm lại để thử tiếp.`;
+        }
+      };
+      ws.onerror = () => { statusEl.textContent = "Lỗi kết nối."; };
+    }
+
+    function stop(sendEof = true) {
+      recording = false;
+      micBtn.textContent = "🎙️ Bắt đầu nói";
+      micBtn.classList.remove("recording");
+      modelSelect.disabled = false;
+      if (workletNode) { workletNode.disconnect(); workletNode = null; }
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      if (ws) {
+        if (sendEof && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "eof" }));
+        ws.close();
+        ws = null;
+      }
+      statusEl.textContent = "Đã dừng.";
+    }
+
+    micBtn.onclick = () => { recording ? stop() : start(); };
+  </script>
+</body>
+
+</html>

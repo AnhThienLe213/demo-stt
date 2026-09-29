@@ -1,0 +1,8 @@
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+faster-whisper==1.1.*
+huggingface_hub>=0.30
+numpy==1.26.*
+onnxruntime==1.19.*
+sherpa-onnx==1.12.*
+requests
