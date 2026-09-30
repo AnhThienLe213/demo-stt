@@ -47,6 +47,7 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from faster_whisper import WhisperModel
@@ -59,6 +60,8 @@ try:
     import sherpa_onnx
 except ImportError:  # chỉ bắt buộc nếu thật sự bật model transducer
     sherpa_onnx = None
+
+load_dotenv()
 
 
 def _env_f(name, default):

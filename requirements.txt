@@ -6,3 +6,4 @@ numpy==1.26.*
 onnxruntime==1.19.*
 sherpa-onnx==1.12.*
 requests
+python-dotenv>=1.0
