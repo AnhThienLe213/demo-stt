@@ -50,8 +50,6 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
-from faster_whisper import WhisperModel
-from huggingface_hub import snapshot_download
 
 from vietnamese import looks_vietnamese
 from vad import FRAME_SAMPLES, FRAME_SEC, SAMPLE_RATE, SpeechSegmenter, StreamingVad
@@ -78,9 +76,6 @@ def _env_i(name, default):
         return default
 
 
-MODEL_SIZE = os.environ.get("PHOWHISPER_SIZE", "small")
-REPO_ID = "quocphu/PhoWhisper-ct2-FasterWhisper"
-SUBFOLDER = f"PhoWhisper-{MODEL_SIZE}-ct2-fasterWhisper"
 LANGUAGE = os.environ.get("LANGUAGE", "vi")
 
 # --- cắt câu ---
@@ -120,20 +115,6 @@ VI_MIN_RATIO = _env_f("VI_MIN_RATIO", 0.6)
 # Số âm tiết lạ liền nhau tối đa. Chỉ dùng tỉ lệ thì không tách được "bật wifi phòng ngủ"
 # (0.75, câu Việt có từ mượn) khỏi chuỗi Whisper nghe tiếng Anh (0.67) — hai vùng chạm nhau.
 VI_MAX_FOREIGN_RUN = _env_i("VI_MAX_FOREIGN_RUN", 2)
-NO_SPEECH_THRESHOLD = _env_f("NO_SPEECH_THRESHOLD", 0.6)
-LOG_PROB_THRESHOLD = _env_f("LOG_PROB_THRESHOLD", -1.0)
-COMPRESSION_RATIO_THRESHOLD = _env_f("COMPRESSION_RATIO_THRESHOLD", 2.4)
-# Trần số token sinh ra, tính theo độ dài đoạn. Đây là dây an toàn chống vòng lặp lặp chữ
-# của Whisper: một câu 2.6s từng sinh ra hàng trăm dấu chấm và ngốn 11.3s decode (rtf 4.3),
-# kéo cả hàng đợi phía sau. Tiếng Việt nói nhanh ~5 từ/s ≈ 12 token/s nên 16 vẫn dư biên.
-MAX_TOKENS_PER_SEC = _env_f("MAX_TOKENS_PER_SEC", 16.0)
-MIN_NEW_TOKENS = _env_i("MIN_NEW_TOKENS", 32)
-# Đoạn do VAD cắt ra bắt đầu ngay tại chỗ có tiếng, và Whisper hay lặp âm đầu khi gặp kiểu
-# vào đột ngột đó ("ch chỉnh", "m mở" — thấy đúng ở cùng một câu qua nhiều lần đo). Chèn một
-# quãng im trước mặt rồi vuốt biên độ lên, đúng như khi nó nghe một file thu sẵn.
-LEAD_SILENCE_SEC = _env_f("LEAD_SILENCE_SEC", 0.20)
-FADE_IN_SEC = _env_f("FADE_IN_SEC", 0.01)
-
 # Mặc định để dành 1 core cho event loop asyncio + VAD, phần còn lại (tối đa 4) cho
 # decode — hardcode 4 trên máy ít core hơn sẽ oversubscribe và làm chậm mọi thứ.
 _DEFAULT_CT2_THREADS = max(1, min(4, (os.cpu_count() or 4) - 1))
@@ -141,8 +122,7 @@ CT2_CPU_THREADS = _env_i("CT2_CPU_THREADS", _DEFAULT_CT2_THREADS)
 
 app = FastAPI()
 _HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = Path(__file__).resolve().parents[1]
-LOCAL_MODEL_ROOT = ROOT_DIR / "model"
+LOCAL_MODEL_ROOT = Path(_HERE) / "model"
 LAB_URL = os.environ.get("LAB_URL", "http://localhost:8890")
 INDEX_HTML = (
     open(os.path.join(_HERE, "index.html"), encoding="utf-8")
@@ -150,28 +130,6 @@ INDEX_HTML = (
     .replace("{{LAB_URL}}", LAB_URL)
     .replace("{{LAB_LABEL}}", LAB_URL.split("://", 1)[-1].rstrip("/"))
 )
-
-_local_dir = snapshot_download(repo_id=REPO_ID, allow_patterns=[f"{SUBFOLDER}/*"])
-MODEL_DIR = os.environ.get("PHOWHISPER_MODEL_DIR") or os.path.join(_local_dir, SUBFOLDER)
-model = WhisperModel(
-    MODEL_DIR, device="cpu", compute_type="int8", cpu_threads=CT2_CPU_THREADS
-)
-
-
-def _warmup(m: WhisperModel) -> None:
-    """Chạy một lượt decode câm lúc khởi động. CTranslate2 tốn thêm chi phí (cấp phát
-    bộ nhớ, cache nội bộ) ở lần transcribe() đầu tiên trong đời tiến trình; nếu không
-    làm nóng trước, client đầu tiên kết nối sẽ gánh trọn phần trễ này vào câu đầu tiên
-    của họ thay vì nó được trả trước lúc server chưa nhận request nào."""
-    dummy = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
-    try:
-        list(m.transcribe(dummy, language=LANGUAGE, beam_size=1)[0])
-    except Exception:
-        pass
-
-
-_warmup(model)
-
 
 _REPEAT_PUNCT = re.compile(r"([^\w\s])\1{2,}")
 _REPEAT_WORD = re.compile(r"\b(\w+)( \1\b){2,}")
@@ -182,64 +140,6 @@ def tidy(text: str) -> str:
     text = _REPEAT_PUNCT.sub(r"\1", text)
     text = _REPEAT_WORD.sub(r"\1", text)
     return re.sub(r"\s+", " ", text).strip()
-
-
-def _lead_in(audio: np.ndarray) -> np.ndarray:
-    """Thêm quãng im đầu + vuốt biên độ, chống lặp âm đầu (xem LEAD_SILENCE_SEC)."""
-    n_fade = min(audio.size, round(FADE_IN_SEC * SAMPLE_RATE))
-    if n_fade:
-        audio = audio.copy()
-        audio[:n_fade] *= np.linspace(0.0, 1.0, n_fade, dtype=np.float32)
-    lead = np.zeros(round(LEAD_SILENCE_SEC * SAMPLE_RATE), dtype=np.float32)
-    return np.concatenate([lead, audio])
-
-
-def transcribe(audio: np.ndarray, *, beam_size: int, temperatures) -> str:
-    """Decode một đoạn đã được VAD cắt sẵn.
-
-    vad_filter tắt: đoạn vào đây đã là vùng có tiếng do Silero cắt, chạy lại VAD của
-    faster-whisper chỉ tốn thêm thời gian.
-    condition_on_previous_text tắt: đưa chữ cũ làm prompt khiến model bám vào lỗi trước đó và
-    khuếch đại thành vòng lặp lặp câu — lỗi đã thấy rõ ở bản LocalAgreement.
-    """
-    dur = audio.size / SAMPLE_RATE
-    segments, _info = model.transcribe(
-        _lead_in(audio),
-        language=LANGUAGE,
-        beam_size=beam_size,
-        temperature=temperatures,
-        condition_on_previous_text=False,
-        vad_filter=False,
-        no_speech_threshold=NO_SPEECH_THRESHOLD,
-        log_prob_threshold=LOG_PROB_THRESHOLD,
-        compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
-        max_new_tokens=max(MIN_NEW_TOKENS, int(dur * MAX_TOKENS_PER_SEC)),
-    )
-    parts = []
-    for seg in segments:
-        # Whisper hay "chép" cả khoảng lặng thành câu chào/quảng cáo. Bỏ đoạn mà chính model
-        # cũng cho là không có tiếng nói.
-        if seg.no_speech_prob is not None and seg.no_speech_prob > NO_SPEECH_THRESHOLD:
-            continue
-        # Lọc từng đoạn trước: một câu dài có thể chỉ rác ở một khúc.
-        if not looks_vietnamese(seg.text, VI_MIN_RATIO, VI_MAX_FOREIGN_RUN):
-            continue
-        parts.append(seg.text)
-    text = tidy("".join(parts))
-    # Lọc lại toàn câu: từng đoạn có thể vừa đủ qua ngưỡng mà gộp lại thì không.
-    if text and not looks_vietnamese(text, VI_MIN_RATIO, VI_MAX_FOREIGN_RUN):
-        return ""
-    return text
-
-
-class PhoWhisperBackend:
-    """Bọc lại model + hàm transcribe() sẵn có, khớp interface chung `.transcribe(...)`."""
-
-    name = "phowhisper"
-    label = "PhoWhisper (Whisper fine-tune, CTranslate2)"
-
-    def transcribe(self, audio: np.ndarray, *, beam_size: int, temperatures) -> str:
-        return transcribe(audio, beam_size=beam_size, temperatures=temperatures)
 
 
 class TransducerBackend:
@@ -289,8 +189,7 @@ class TransducerBackend:
             decoding_method="greedy_search",
             provider="cpu",
         )
-        # warm-up — tránh request đầu tiên gánh chi phí khởi tạo (giống lý do đã làm cho
-        # PhoWhisper ở _warmup()).
+        # warm-up để request đầu tiên không phải gánh chi phí khởi tạo.
         s = self._recognizer.create_stream()
         s.accept_waveform(SAMPLE_RATE, np.zeros(8000, dtype=np.float32))
         self._recognizer.decode_stream(s)
@@ -349,27 +248,13 @@ def _download_zipformer() -> str:
 
 
 def _build_backends() -> dict:
-    """Nạp các model còn lại khi app khởi động, bỏ qua backend nào tải/nạp lỗi."""
-    backends = {"phowhisper": PhoWhisperBackend()}
-    specs = [
-        (
-            "gipformer",
-            "Gipformer 65M RNN-T",
-            lambda: _local_model_dir("gipformer"),
-        ),
-        (
-            "zipformer",
-            "Zipformer 30M RNN-T",
-            lambda: _local_model_dir("zipformer"),
-        ),
-    ]
-    for name, label, get_model_dir in specs:
-        try:
-            model_dir = get_model_dir()
-            backends[name] = TransducerBackend(name, label, model_dir)
-        except Exception as exc:  # noqa: BLE001 - thiếu 1 model không được làm chết server
-            print(f"[!] Bỏ qua model '{name}': {exc}")
-    return backends
+    """Nạp Zipformer làm backend duy nhất."""
+    model_dir = _download_zipformer()
+    return {
+        "zipformer": TransducerBackend(
+            "zipformer", "Zipformer 30M RNN-T", model_dir
+        )
+    }
 
 
 class _Job:
@@ -434,7 +319,7 @@ class DecodeWorker:
 
 worker = DecodeWorker()
 BACKENDS = _build_backends()
-DEFAULT_BACKEND = "phowhisper"
+DEFAULT_BACKEND = "zipformer"
 
 
 class Session:
@@ -623,8 +508,8 @@ def list_models():
 def healthz():
     return {
         "status": "ok",
-        "model": SUBFOLDER,
-        "model_dir": MODEL_DIR,
+        "model": DEFAULT_BACKEND,
+        "model_dir": _local_model_dir(DEFAULT_BACKEND),
         "models_loaded": list(BACKENDS.keys()),
         "sample_rate": SAMPLE_RATE,
         "config": {
@@ -640,8 +525,6 @@ def healthz():
             "preview_beam": PREVIEW_BEAM,
             "confirm_beam": CONFIRM_BEAM,
             "confirm_temperatures": list(CONFIRM_TEMPERATURES),
-            "max_tokens_per_sec": MAX_TOKENS_PER_SEC,
-            "lead_silence_sec": LEAD_SILENCE_SEC,
             "vi_min_ratio": VI_MIN_RATIO,
             "vi_max_foreign_run": VI_MAX_FOREIGN_RUN,
             "min_speech_sec": MIN_SPEECH_SEC,
@@ -653,8 +536,7 @@ def healthz():
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    requested = ws.query_params.get("model", DEFAULT_BACKEND)
-    backend_name = requested if requested in BACKENDS else DEFAULT_BACKEND
+    backend_name = DEFAULT_BACKEND
     sess = Session(ws, asyncio.get_running_loop(), backend_name)
 
     async def pump():
@@ -667,9 +549,7 @@ async def ws_endpoint(ws: WebSocket):
             "type": "ready",
             "sample_rate": SAMPLE_RATE,
             "model": backend_name,
-            # client xin model không tồn tại/chưa nạp được thì báo lại đã fallback về gì,
-            # để UI có thể tự cập nhật dropdown thay vì âm thầm dùng nhầm model.
-            "requested_model": requested,
+            "requested_model": backend_name,
         }))
         while True:
             msg = await ws.receive()

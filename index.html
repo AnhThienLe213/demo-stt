@@ -56,11 +56,6 @@
 
 <body>
   <h2>Demo nhận dạng giọng nói tiếng Việt (thời gian thực)</h2>
-  <p>
-    Model: <select id="modelSelect">
-      <option value="phowhisper">Đang tải danh sách...</option>
-    </select>
-  </p>
   <p id="status">Bấm nút rồi cho phép truy cập mic.</p>
   <button id="mic">🎙️ Bắt đầu nói</button>
   <p id="transcript"></p>
@@ -73,21 +68,6 @@
     const micBtn = document.getElementById("mic");
     const statusEl = document.getElementById("status");
     const transcriptEl = document.getElementById("transcript");
-    const modelSelect = document.getElementById("modelSelect");
-
-    fetch("/models").then(r => r.json()).then(info => {
-      modelSelect.innerHTML = "";
-      for (const m of info.models) {
-        const opt = document.createElement("option");
-        opt.value = m.name;
-        opt.textContent = m.label;
-        if (m.name === info.default) opt.selected = true;
-        modelSelect.appendChild(opt);
-      }
-    }).catch(() => {
-      // /models lỗi thì vẫn để dropdown mặc định phowhisper, không chặn demo
-    });
-
     const LAB_URL = "{{LAB_URL}}";
     const LAB_LABEL = "{{LAB_LABEL}}";
     if (LAB_URL && !LAB_URL.includes("localhost")) {
@@ -120,8 +100,7 @@
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      const model = encodeURIComponent(modelSelect.value || "phowhisper");
-      return `${proto}//${location.host}/ws?model=${model}`;
+      return `${proto}//${location.host}/ws`;
     }
 
     async function start() {
@@ -160,7 +139,6 @@
           statusEl.textContent = "Đang nghe — cứ nói bình thường.";
           micBtn.textContent = "⏹️ Dừng";
           micBtn.classList.add("recording");
-          modelSelect.disabled = true; // đổi model giữa chừng không có tác dụng, khoá lại cho rõ
         } catch (err) {
           statusEl.textContent = err.name === "NotAllowedError"
             ? "Trình duyệt chưa cho phép dùng microphone."
@@ -172,12 +150,7 @@
       ws.onmessage = (ev) => {
         let msg;
         try { msg = JSON.parse(ev.data); } catch { return; }
-        if (msg.type === "ready") {
-          if (msg.model !== msg.requested_model) {
-            statusEl.textContent = `Model "${msg.requested_model}" chưa sẵn sàng trên server, đang dùng "${msg.model}" thay thế.`;
-            modelSelect.value = msg.model;
-          }
-        } else if (msg.type === "partial") {
+        if (msg.type === "partial") {
           if (msg.utt !== currentUtt) return;
           if (!partialSpan) {
             partialSpan = document.createElement("span");
@@ -217,7 +190,6 @@
       recording = false;
       micBtn.textContent = "🎙️ Bắt đầu nói";
       micBtn.classList.remove("recording");
-      modelSelect.disabled = false;
       if (workletNode) { workletNode.disconnect(); workletNode = null; }
       if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
       if (audioCtx) { audioCtx.close(); audioCtx = null; }

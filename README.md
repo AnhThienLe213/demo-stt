@@ -1,10 +1,10 @@
 # Vietnamese Live Speech Recognition
 
-Local FastAPI/WebSocket demo with PhoWhisper, Gipformer, and Zipformer model selection.
+Local FastAPI/WebSocket demo using the Zipformer Vietnamese speech recognition model.
 
 ## Run locally
 
-Use Python 3.10 or newer. The first startup downloads the model files and may take several minutes.
+Use Python 3.10 or newer. The Zipformer model files are included in `model/zipformer`.
 
 ```powershell
 python -m venv .venv
