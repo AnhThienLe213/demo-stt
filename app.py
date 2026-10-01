@@ -100,7 +100,7 @@ PREVIEW_MIN_SEC = _env_f("PREVIEW_MIN_SEC", 0.2)
 # phải chờ (không có cơ chế huỷ giữa chừng). Preview càng dài thì worst-case confirm bị
 # trễ thêm càng lâu — giá trị này chính là trần trên cho độ trễ tăng thêm đó, nên giữ nó
 # ngắn hơn nhiều so với END_SILENCE_SEC để phần lớn thời gian confirm không phải chờ.
-PREVIEW_MAX_SEC = _env_f("PREVIEW_MAX_SEC", 3.0)
+PREVIEW_MAX_SEC = _env_f("PREVIEW_MAX_SEC", 5.0)
 PREVIEW_BEAM = _env_i("PREVIEW_BEAM", 1)
 
 # --- tầng chốt ---
