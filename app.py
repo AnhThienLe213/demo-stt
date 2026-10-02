@@ -40,9 +40,6 @@ import os
 import re
 import threading
 import time
-import tarfile
-import tempfile
-import urllib.request
 
 from pathlib import Path
 
@@ -143,12 +140,11 @@ def tidy(text: str) -> str:
 
 
 class TransducerBackend:
-    """gipformer-65M-rnnt / Zipformer-30M-RNNT-6000h — RNN-Transducer qua sherpa-onnx.
+    """GIPFormer 1.5 — RNN-Transducer qua sherpa-onnx.
 
-    Cả hai đều là bản ONNX OFFLINE (xem lịch sử trao đổi: lỗi "encoder_dims does not
-    exist" khi thử OnlineRecognizer) — không streaming incremental thật, nhưng vẫn dùng
-    được với đúng cơ chế "VAD cắt câu rồi decode trọn câu" hiện có của app này, kể cả cho
-    preview (chỉ là decode một đoạn ngắn hơn, không có gì đặc biệt cho streaming).
+    Đây là bản ONNX OFFLINE, không streaming incremental thật, nhưng vẫn dùng được với
+    cơ chế "VAD cắt câu rồi decode trọn câu" hiện có của app này, kể cả cho preview
+    (chỉ là decode một đoạn ngắn hơn, không có gì đặc biệt cho streaming).
     beam_size/temperatures của tham số gọi chung bị bỏ qua vì recognizer greedy cố định.
     """
 
@@ -217,42 +213,12 @@ def _local_model_dir(name: str) -> str:
     return str(candidate)
 
 
-def _download_zipformer() -> str:
-    local_dir = Path(_local_model_dir("zipformer"))
-    if (local_dir / "encoder-epoch-20-avg-10.onnx").exists() or (local_dir / "encoder.onnx").exists():
-        return str(local_dir)
-
-    model_dir = Path(tempfile.gettempdir()) / "zipformer-vi-30M-int8"
-    if (model_dir / "encoder.onnx").exists():
-        return str(model_dir)
-
-    archive_path = model_dir.with_suffix(".tar.bz2")
-    model_dir.mkdir(parents=True, exist_ok=True)
-    url = (
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
-        "sherpa-onnx-zipformer-vi-30M-int8-2026-02-09.tar.bz2"
-    )
-    urllib.request.urlretrieve(url, archive_path)
-    with tarfile.open(archive_path, "r:bz2") as archive:
-        for member in archive.getmembers():
-            parts = Path(member.name).parts[1:]
-            if not parts:
-                continue
-            destination = (model_dir / Path(*parts)).resolve()
-            if model_dir.resolve() not in destination.parents:
-                raise ValueError(f"đường dẫn không an toàn trong model archive: {member.name}")
-            member.name = str(Path(*parts))
-            archive.extract(member, model_dir)
-    archive_path.unlink(missing_ok=True)
-    return str(model_dir)
-
-
 def _build_backends() -> dict:
-    """Nạp Zipformer làm backend duy nhất."""
-    model_dir = _download_zipformer()
+    """Nạp GIPFormer 1.5 làm backend duy nhất."""
+    model_dir = _local_model_dir("gipformer1.5")
     return {
-        "zipformer": TransducerBackend(
-            "zipformer", "Zipformer 30M RNN-T", model_dir
+        "gipformer1.5": TransducerBackend(
+            "gipformer1.5", "GIPFormer 1.5", model_dir
         )
     }
 
@@ -319,7 +285,7 @@ class DecodeWorker:
 
 worker = DecodeWorker()
 BACKENDS = _build_backends()
-DEFAULT_BACKEND = "zipformer"
+DEFAULT_BACKEND = "gipformer1.5"
 
 
 class Session:
